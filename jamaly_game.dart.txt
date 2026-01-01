@@ -1,0 +1,379 @@
+import 'dart:math';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
+
+void main() {
+  // التأكد من تهيئة النظام وتثبيت الاتجاه الأفقي
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]).then((_) {
+    runApp(const JamalyApp());
+  });
+}
+
+class JamalyApp extends StatelessWidget {
+  const JamalyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // تشغيل وضع ملء الشاشة لإخفاء الأشرطة
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Jamaly Game',
+      theme: ThemeData(
+        primarySwatch: Colors.brown,
+        fontFamily: 'Cairo', // استخدام خط متناسق إذا كان متاحاً
+      ),
+      home: const GameScreen(),
+    );
+  }
+}
+
+// --- نظام فيزياء اللبن (الموج) ---
+class MilkSpring {
+  double height;
+  double targetHeight;
+  double velocity = 0;
+  final double k = 0.02; // قوة النابض
+  final double damp = 0.03; // معامل الخمود لتوقف الموجة تدريجياً
+
+  MilkSpring({required this.targetHeight}) : height = targetHeight;
+
+  void update() {
+    double x = height - targetHeight;
+    double acceleration = -k * x - damp * velocity;
+    velocity += acceleration;
+    height += velocity;
+  }
+}
+
+// --- موديلات اللعبة ---
+enum CookieState { FLYING, HELD, DROPPING }
+
+class Cookie {
+  double x, y, vx, vy, r, angle;
+  CookieState state;
+  double twistOffset = 0;
+  bool isDead = false;
+
+  Cookie({
+    required this.x, 
+    required this.y, 
+    required this.vx, 
+    required this.vy,
+    this.r = 60, 
+    this.state = CookieState.FLYING, 
+    this.angle = 0,
+  });
+}
+
+class Particle {
+  double x, y, vx, vy, size, life;
+  Color color;
+  Particle(this.x, this.y, this.vx, this.vy, this.color) : size = 5.0, life = 1.0;
+
+  void update() {
+    x += vx; 
+    y += vy; 
+    vy += 0.4; // جاذبية للجزيئات
+    life -= 0.03;
+  }
+}
+
+class GameScreen extends StatefulWidget {
+  const GameScreen({super.key});
+
+  @override
+  State<GameScreen> createState() => _GameScreenState();
+}
+
+class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateMixin {
+  late Ticker _ticker;
+  Size sz = Size.zero;
+  int score = 0;
+  double timeLeft = 60;
+  bool isPlaying = true;
+
+  List<Cookie> cookies = [];
+  List<Cookie> held = [];
+  List<Particle> particles = [];
+  List<MilkSpring> springs = [];
+  Rect glassRect = Rect.zero;
+  Offset touchPos = Offset.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    // تشغيل محرك التحديث
+    _ticker = createTicker(_onTick)..start();
+    _spawnLoop();
+  }
+
+  // تشغيل الصوت والاهتزاز عند التفاعل
+  void _playFeedback(bool isDunk) {
+    if (isDunk) {
+      HapticFeedback.vibrate(); 
+      SystemSound.play(SystemSoundType.click); 
+    } else {
+      HapticFeedback.lightImpact();
+    }
+  }
+
+  Future<void> _spawnLoop() async {
+    while (isPlaying && mounted) {
+      await Future.delayed(const Duration(milliseconds: 1400));
+      if (sz != Size.zero && isPlaying) {
+        Random r = Random();
+        setState(() {
+          cookies.add(Cookie(
+            x: sz.width + 60,
+            y: sz.height * 0.3 + r.nextDouble() * (sz.height * 0.4),
+            vx: -(4.0 + r.nextDouble() * 4),
+            vy: -7.0,
+          ));
+        });
+      }
+    }
+  }
+
+  void _onTick(Duration d) {
+    if (sz == Size.zero || !isPlaying) return;
+    
+    setState(() {
+      if (timeLeft > 0) {
+        timeLeft -= 0.016;
+      } else {
+        timeLeft = 0;
+        isPlaying = false;
+      }
+
+      // تحديث حركة الموج في اللبن
+      for (var s in springs) s.update();
+      for (int i = 0; i < springs.length; i++) {
+        if (i > 0) {
+          double d = 0.1 * (springs[i].height - springs[i - 1].height);
+          springs[i - 1].velocity += d;
+        }
+        if (i < springs.length - 1) {
+          double d = 0.1 * (springs[i].height - springs[i + 1].height);
+          springs[i + 1].velocity += d;
+        }
+      }
+
+      // تحديث حركة البسكويت
+      for (var c in cookies) {
+        if (c.state != CookieState.HELD) {
+          c.vy += 0.35; 
+          c.x += c.vx; 
+          c.y += c.vy; 
+          c.angle += 0.06;
+          
+          // الكشف عن السقوط داخل الكوب
+          if (glassRect.contains(Offset(c.x, c.y)) && c.y > springs[0].targetHeight && !c.isDead) {
+            _handleDunk(c);
+          }
+        }
+      }
+
+      // حركة البسكويت الممسوك
+      for (var c in held) {
+        c.x = ui.lerpDouble(c.x, touchPos.dx, 0.2)!;
+        c.y = ui.lerpDouble(c.y, touchPos.dy, 0.2)!;
+        if (c.twistOffset < 22) c.twistOffset += 2; // تأثير "اللف"
+      }
+
+      cookies.removeWhere((c) => c.isDead || c.y > sz.height + 100);
+      for (var p in particles) p.update();
+      particles.removeWhere((p) => p.life <= 0);
+    });
+  }
+
+  void _handleDunk(Cookie c) {
+    c.isDead = true; 
+    score += 150;
+    _playFeedback(true);
+    
+    // إحداث موجة عند مكان السقوط
+    int idx = (((c.x - glassRect.left) / glassRect.width) * springs.length).floor().clamp(0, springs.length - 1);
+    springs[idx].velocity = 45;
+    
+    // إضافة طرطشة لبن
+    for (int i = 0; i < 12; i++) {
+      particles.add(Particle(c.x, springs[idx].height, (Random().nextDouble() - 0.5) * 7, -6, Colors.white));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    sz = MediaQuery.of(context).size;
+    if (sz != Size.zero && springs.isEmpty) {
+      // تحديد مكان الكوب بناءً على حجم الشاشة
+      glassRect = Rect.fromLTWH(sz.width * 0.1, sz.height - 260, 180, 240);
+      for (int i = 0; i < 40; i++) {
+        springs.add(MilkSpring(targetHeight: glassRect.top + 70));
+      }
+    }
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFB3E5FC),
+      body: GestureDetector(
+        onPanUpdate: (d) {
+          touchPos = d.localPosition;
+          for (int i = cookies.length - 1; i >= 0; i--) {
+            // التقاط البسكويت إذا كان قريباً من اللمس
+            if ((Offset(cookies[i].x, cookies[i].y) - touchPos).distance < 75 && cookies[i].state == CookieState.FLYING) {
+              _playFeedback(false);
+              setState(() {
+                cookies[i].state = CookieState.HELD;
+                held.add(cookies.removeAt(i));
+              });
+              break;
+            }
+          }
+        },
+        onPanEnd: (_) {
+          setState(() {
+            for (var c in held) { 
+              c.state = CookieState.DROPPING; 
+              c.vy = 2; 
+              cookies.add(c); 
+            }
+            held.clear();
+          });
+        },
+        child: Stack(
+          children: [
+            CustomPaint(
+              painter: GamePainter(
+                cookies: [...cookies, ...held], 
+                springs: springs, 
+                glassRect: glassRect, 
+                particles: particles
+              ), 
+              child: Container()
+            ),
+            Positioned(top: 25, left: 25, child: _hudCard("🍪 النقاط: $score", Colors.brown)),
+            Positioned(top: 25, right: 25, child: _hudCard("⏱️ الوقت: ${timeLeft.toInt()}", Colors.blue)),
+            if (!isPlaying) _gameOverUI(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _hudCard(String text, Color col) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.9), 
+        borderRadius: BorderRadius.circular(15), 
+        border: Border.all(color: col, width: 2)
+      ),
+      child: Text(text, style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: col)),
+    );
+  }
+
+  Widget _gameOverUI() {
+    return Container(
+      color: Colors.black54,
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.all(40),
+          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text("انتهى الوقت!", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.red)),
+              const SizedBox(height: 10),
+              Text("نقاطك النهائية: $score", style: const TextStyle(fontSize: 22)),
+              const SizedBox(height: 25),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.brown, foregroundColor: Colors.white),
+                onPressed: () => setState(() {
+                  score = 0; timeLeft = 60; isPlaying = true; cookies.clear();
+                }),
+                child: const Text("العب مرة أخرى", style: TextStyle(fontSize: 18)),
+              )
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+}
+
+class GamePainter extends CustomPainter {
+  final List<Cookie> cookies;
+  final List<MilkSpring> springs;
+  final List<Particle> particles;
+  final Rect glassRect;
+
+  GamePainter({required this.cookies, required this.springs, required this.glassRect, required this.particles});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // رسم الكوب واللبن
+    final glassP = Paint()..color = Colors.white.withOpacity(0.3);
+    canvas.drawRRect(RRect.fromRectAndRadius(glassRect, const Radius.circular(15)), glassP);
+    
+    if (springs.isNotEmpty) {
+      Path milk = Path();
+      milk.moveTo(glassRect.left, glassRect.bottom);
+      milk.lineTo(glassRect.left, springs[0].height);
+      for (int i = 0; i < springs.length - 1; i++) {
+        double x1 = glassRect.left + (glassRect.width * i / (springs.length - 1));
+        double x2 = glassRect.left + (glassRect.width * (i + 1) / (springs.length - 1));
+        milk.quadraticBezierTo(x1, springs[i].height, x2, springs[i + 1].height);
+      }
+      milk.lineTo(glassRect.right, glassRect.bottom); 
+      milk.close();
+      canvas.drawPath(milk, Paint()..color = Colors.white);
+    }
+
+    // رسم البسكويت
+    for (var c in cookies) {
+      canvas.save();
+      canvas.translate(c.x, c.y);
+      if (c.state != CookieState.HELD) {
+        canvas.rotate(c.angle);
+        _drawCookie(canvas, c.r);
+      } else {
+        // رسم قطعتين عند اللف
+        canvas.save(); canvas.translate(-c.twistOffset, 0); _drawCookie(canvas, c.r * 0.7); canvas.restore();
+        canvas.save(); canvas.translate(c.twistOffset, 0); _drawCookie(canvas, c.r * 0.7); canvas.restore();
+      }
+      canvas.restore();
+    }
+
+    // رسم الجزيئات (الطرطشة)
+    for (var p in particles) {
+      canvas.drawCircle(Offset(p.x, p.y), p.size, Paint()..color = p.color.withOpacity(p.life));
+    }
+  }
+
+  void _drawCookie(Canvas canvas, double r) {
+    final darkBrown = const Color(0xFF3E2723);
+    canvas.drawCircle(Offset.zero, r, Paint()..color = darkBrown);
+    canvas.drawCircle(Offset.zero, r * 0.85, Paint()..color = Colors.white);
+    canvas.drawCircle(Offset.zero, r * 0.75, Paint()..color = darkBrown);
+    
+    // إضافة نقش بسيط
+    final detailPaint = Paint()..color = Colors.black12..style = PaintingStyle.stroke..strokeWidth = 2;
+    canvas.drawCircle(Offset.zero, r * 0.5, detailPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
