@@ -1,0 +1,592 @@
+import 'dart:math';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/scheduler.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // التأكيد على تثبيت الاتجاه الأفقي لضمان تجربة اللعب الصحيحة
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]).then((_) {
+    runApp(const JamalyApp());
+  });
+}
+
+class JamalyApp extends StatelessWidget {
+  const JamalyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    // إخفاء أشرطة النظام للحصول على تجربة لعب غامرة (Full Screen)
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Jamaly Twist Lick Dunk',
+      theme: ThemeData(fontFamily: 'Cairo'),
+      home: const GameScreen(),
+    );
+  }
+}
+
+// --- نظام النوابض للبن (Physics Spring System) ---
+class MilkSpring {
+  double height;
+  double targetHeight;
+  double velocity = 0;
+  // تحسين معاملات الفيزياء لجعل الموج أكثر ليونة
+  final double k = 0.015; 
+  final double damp = 0.02; 
+
+  MilkSpring({required this.targetHeight}) : height = targetHeight;
+
+  void update() {
+    double x = height - targetHeight;
+    double acceleration = -k * x - damp * velocity;
+    velocity += acceleration;
+    height += velocity;
+  }
+}
+
+// --- Models ---
+enum CookieState { FLYING, TWISTED, LICKED, HELD, DROPPING }
+
+class Cookie {
+  double x, y, vx, vy, r, angle, rotSpeed;
+  CookieState state;
+  double twistOffset;
+  Color color;
+  bool isDead = false;
+  double dragOffsetX = 0;
+  double dragOffsetY = 0;
+  int faceType; // 0: MALE (JAMALY), 1: FEMALE (JAMILA)
+
+  Cookie({
+    required this.x, required this.y, required this.vx, required this.vy,
+    this.r = 65, 
+    this.state = CookieState.FLYING,
+    this.twistOffset = 0,
+    this.angle = 0,
+    this.rotSpeed = 0.05,
+    this.color = const Color(0xFF3E2723),
+    required this.faceType,
+  });
+}
+
+class Particle {
+  double x, y, vx, vy, size, life;
+  Color color;
+  double opacity = 1.0;
+
+  Particle(this.x, this.y, this.vx, this.vy, this.color)
+      : size = Random().nextDouble() * 8 + 3, life = 1.0;
+
+  void update() {
+    x += vx;
+    y += vy;
+    vy += 0.5;
+    life -= 0.025;
+    opacity = life.clamp(0, 1);
+  }
+}
+
+class FloatingText {
+  double x, y;
+  String text, subText;
+  double life, scale;
+  Color color;
+  FloatingText(this.x, this.y, this.text, this.subText, {this.color = const Color(0xFFD32F2F)})
+      : life = 1.0, scale = 0.5;
+}
+
+// --- Main Screen ---
+class GameScreen extends StatefulWidget {
+  const GameScreen({super.key});
+
+  @override
+  State<GameScreen> createState() => _GameScreenState();
+}
+
+class _GameScreenState extends State<GameScreen> with SingleTickerProviderStateMixin {
+  late Ticker _ticker;
+  Size screenSize = Size.zero;
+  bool isPlaying = false;
+  int score = 0;
+  double timeLeft = 60;
+
+  List<Cookie> cookies = [];
+  List<Cookie> heldCookies = [];
+  List<Particle> particles = [];
+  List<FloatingText> texts = [];
+  List<MilkSpring> springs = []; 
+
+  double fanAngle = 0;
+  Rect glassRect = Rect.zero;
+  Offset touchPosition = Offset.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker(_onTick)..start();
+    _startGame();
+  }
+
+  void _initSprings(double surfaceY) {
+    if (springs.isNotEmpty) return;
+    // زيادة عدد النوابض لجعل شكل الموجة أكثر نعومة (Smooth)
+    for (int i = 0; i < 60; i++) {
+      springs.add(MilkSpring(targetHeight: surfaceY));
+    }
+  }
+
+  void _startGame() {
+    score = 0;
+    timeLeft = 60;
+    cookies.clear();
+    heldCookies.clear();
+    particles.clear();
+    texts.clear();
+    isPlaying = true;
+    _spawnLoop();
+  }
+
+  Future<void> _spawnLoop() async {
+    while (isPlaying && mounted) {
+      await Future.delayed(const Duration(milliseconds: 1200));
+      if (!isPlaying) break;
+      _spawnCookie();
+    }
+  }
+
+  void _spawnCookie() {
+    if (screenSize == Size.zero) return;
+    Random rng = Random();
+    cookies.add(Cookie(
+      x: screenSize.width + 100,
+      y: screenSize.height * 0.4 + rng.nextDouble() * screenSize.height * 0.3,
+      vx: -(5.0 + rng.nextDouble() * 4.0),
+      vy: -(8.0 + rng.nextDouble() * 4.0),
+      faceType: rng.nextInt(2),
+    ));
+  }
+
+  void _onTick(Duration elapsed) {
+    if (screenSize == Size.zero) return;
+
+    setState(() {
+      if (timeLeft > 0) timeLeft -= 0.016;
+      else { timeLeft = 0; isPlaying = false; }
+
+      fanAngle += 0.05;
+
+      // تحديث حركة الموج
+      for (var s in springs) s.update();
+      
+      // نظام نقل الحركة بين النوابض (تأثير انتشار الموجة)
+      double spread = 0.15; // معامل انتشار الموجة للأطراف
+      for (int iteration = 0; iteration < 4; iteration++) { // تمرير الحركة عدة مرات للتنعيم
+        for (int i = 0; i < springs.length; i++) {
+          if (i > 0) {
+            double diff = spread * (springs[i].height - springs[i - 1].height);
+            springs[i - 1].velocity += diff;
+            springs[i - 1].height += diff;
+          }
+          if (i < springs.length - 1) {
+            double diff = spread * (springs[i].height - springs[i + 1].height);
+            springs[i + 1].velocity += diff;
+            springs[i + 1].height += diff;
+          }
+        }
+      }
+
+      for (var c in cookies) {
+        if (c.state != CookieState.HELD) {
+          c.vy += 0.35;
+          c.x += c.vx;
+          c.y += c.vy;
+          c.angle += c.rotSpeed;
+
+          if (c.y > springs[0].targetHeight && c.x > glassRect.left && c.x < glassRect.right && !c.isDead) {
+            _dunkCookie(c);
+          }
+        }
+        if (c.y > screenSize.height + 150) c.isDead = true;
+      }
+
+      for (var c in heldCookies) {
+        c.x = ui.lerpDouble(c.x, touchPosition.dx + c.dragOffsetX, 0.2)!;
+        c.y = ui.lerpDouble(c.y, touchPosition.dy + c.dragOffsetY, 0.2)!;
+        if (c.twistOffset < 22) c.twistOffset += 2;
+      }
+
+      cookies.removeWhere((c) => c.isDead);
+      for (var p in particles) p.update();
+      particles.removeWhere((p) => p.life <= 0);
+
+      for (var t in texts) {
+        t.y -= 1.2; t.life -= 0.02;
+        if (t.scale < 1.4) t.scale += 0.04;
+      }
+      texts.removeWhere((t) => t.life <= 0);
+    });
+  }
+
+  void _dunkCookie(Cookie c) {
+    c.isDead = true;
+    score += 250;
+    // تحديد مكان الارتطام لتشغيل الموجة من النقطة الصحيحة
+    int idx = (((c.x - glassRect.left) / glassRect.width) * springs.length).floor().clamp(0, springs.length - 1);
+    springs[idx].velocity = 45; // قوة ارتطام أكبر
+    texts.add(FloatingText(c.x, c.y - 120, "DUNKED!", "+250", color: Colors.blueAccent));
+
+    Random rng = Random();
+    for (int i = 0; i < 25; i++) {
+      double angle = -pi/2 + (rng.nextDouble() - 0.5) * 1.5;
+      double speed = rng.nextDouble() * 15 + 8;
+      particles.add(Particle(c.x, springs[idx].height, cos(angle) * speed, sin(angle) * speed, Colors.white));
+    }
+  }
+
+  void _onPanStart(DragStartDetails d) { touchPosition = d.localPosition; _checkInteraction(); }
+  void _onPanUpdate(DragUpdateDetails d) { touchPosition = d.localPosition; _checkInteraction(); }
+  void _onPanEnd(DragEndDetails d) {
+    for (var c in heldCookies) {
+      c.state = CookieState.DROPPING;
+      c.vx = d.velocity.pixelsPerSecond.dx * 0.001;
+      c.vy = d.velocity.pixelsPerSecond.dy * 0.001 + 2;
+      cookies.add(c);
+    }
+    heldCookies.clear();
+  }
+
+  void _checkInteraction() {
+    for (int i = cookies.length - 1; i >= 0; i--) {
+      var c = cookies[i];
+      if (c.state == CookieState.FLYING || c.state == CookieState.DROPPING) {
+        if ((Offset(c.x, c.y) - touchPosition).distance < 100) {
+          c.state = CookieState.HELD;
+          c.vx = 0; c.vy = 0; c.angle = 0;
+          c.dragOffsetX = c.x - touchPosition.dx;
+          c.dragOffsetY = c.y - touchPosition.dy;
+          cookies.removeAt(i);
+          heldCookies.add(c);
+          score += 100;
+          texts.add(FloatingText(c.x, c.y - 80, "GOT IT!", "+100", color: Colors.orange));
+          break;
+        }
+      }
+    }
+  }
+
+  @override
+  void dispose() { _ticker.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    screenSize = MediaQuery.of(context).size;
+    if (screenSize != Size.zero) {
+      glassRect = Rect.fromLTWH(80, screenSize.height - 300, 200, 280);
+      _initSprings(glassRect.top + 80);
+    }
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        onPanStart: _onPanStart, onPanUpdate: _onPanUpdate, onPanEnd: _onPanEnd,
+        child: Stack(
+          children: [
+            CustomPaint(
+              painter: GamePainter(
+                cookies: [...cookies, ...heldCookies], 
+                particles: particles, 
+                texts: texts, 
+                springs: springs, 
+                fanAngle: fanAngle, 
+                glassRect: glassRect
+              ), 
+              child: Container()
+            ),
+            Positioned(top: 20, left: 20, child: _buildHud("🍪 $score", Colors.orange)),
+            Positioned(top: 20, right: 20, child: _buildHud("⏱️ ${timeLeft.toInt()}", Colors.lightBlue)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHud(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.9), 
+        borderRadius: BorderRadius.circular(20), 
+        border: Border.all(color: color, width: 3),
+        boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 5)]
+      ),
+      child: Text(text, style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: color)),
+    );
+  }
+}
+
+class GamePainter extends CustomPainter {
+  final List<Cookie> cookies;
+  final List<Particle> particles;
+  final List<FloatingText> texts;
+  final List<MilkSpring> springs;
+  final double fanAngle;
+  final Rect glassRect;
+
+  GamePainter({
+    required this.cookies, 
+    required this.particles, 
+    required this.texts, 
+    required this.springs, 
+    required this.fanAngle, 
+    required this.glassRect
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _drawKitchen(canvas, size);
+    _drawGlassBack(canvas);
+    _drawCookies(canvas);
+    _drawGlassFront(canvas);
+    _drawParticles(canvas);
+    _drawTexts(canvas);
+  }
+
+  void _drawKitchen(Canvas canvas, Size size) {
+    canvas.drawRect(Rect.fromLTWH(0, 0, size.width, size.height), Paint()..color = const Color(0xFF81D4FA));
+    
+    canvas.save();
+    canvas.translate(size.width * 0.3, 60);
+    canvas.rotate(fanAngle);
+    for(int i=0; i<3; i++) {
+      canvas.drawRRect(RRect.fromRectAndRadius(const Rect.fromLTWH(-10, -8, 20, 100), const Radius.circular(10)), Paint()..color = const Color(0xFFFFCC80));
+      canvas.rotate(2*pi/3);
+    }
+    canvas.restore();
+
+    double fridX = size.width - 280; 
+    double fridY = size.height * 0.1;
+    double fridW = 200;
+    double fridH = size.height * 0.85;
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(fridX, fridY, fridW, fridH), const Radius.circular(15)), Paint()..color = const Color(0xFFEEEEEE));
+    canvas.drawRect(Rect.fromLTWH(fridX, fridY + fridH * 0.3, fridW, 3), Paint()..color = Colors.grey.withOpacity(0.4));
+    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(fridX + 15, fridY + 40, 12, 80), const Radius.circular(5)), Paint()..color = Colors.grey.shade400);
+    _drawMagnetText(canvas, fridX + 35, fridY + 50, "JAMALY");
+
+    canvas.drawRect(Rect.fromLTWH(0, size.height - 100, size.width, 15), Paint()..color = const Color(0xFF5D4037));
+    canvas.drawRect(Rect.fromLTWH(0, size.height - 85, size.width, 85), Paint()..color = const Color(0xFFEF6C00));
+  }
+
+  void _drawMagnetText(Canvas canvas, double x, double y, String text) {
+    List<Color> colors = [Colors.red, Colors.blue, Colors.green, Colors.orange, Colors.purple, Colors.pink];
+    for (int i = 0; i < text.length; i++) {
+      TextPainter(
+        text: TextSpan(text: text[i], style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: colors[i % colors.length])), 
+        textDirection: TextDirection.ltr
+      )..layout()..paint(canvas, Offset(x + i * 24, y + sin(i + fanAngle)*4));
+    }
+  }
+
+  void _drawGlassBack(Canvas canvas) {
+    // رسم جسم الكوب الشفاف
+    canvas.drawRRect(RRect.fromRectAndRadius(glassRect, const Radius.circular(12)), Paint()..color = Colors.white.withOpacity(0.15));
+    
+    if (springs.isNotEmpty) {
+      // رسم موج اللبن باستخدام Bezier Curves لجعلها ناعمة جداً
+      Path milkPath = Path();
+      milkPath.moveTo(glassRect.left + 5, glassRect.bottom - 5);
+      milkPath.lineTo(glassRect.left + 5, springs[0].height);
+
+      for (int i = 0; i < springs.length - 1; i++) {
+        double x1 = glassRect.left + 5 + ((glassRect.width - 10) * i / (springs.length - 1));
+        double x2 = glassRect.left + 5 + ((glassRect.width - 10) * (i + 1) / (springs.length - 1));
+        double y1 = springs[i].height;
+        double y2 = springs[i+1].height;
+        
+        // استخدام Cubic Bezier لتنعيم الوصلات بين النوابض
+        milkPath.cubicTo(
+          (x1 + x2) / 2, y1, 
+          (x1 + x2) / 2, y2, 
+          x2, y2
+        );
+      }
+
+      milkPath.lineTo(glassRect.right - 5, glassRect.bottom - 5);
+      milkPath.close();
+
+      // تدرج لوني للبن لإعطاء عمق
+      final milkGradient = ui.Gradient.linear(
+        Offset(glassRect.center.dx, glassRect.top),
+        Offset(glassRect.center.dx, glassRect.bottom),
+        [Colors.white, const Color(0xFFF5F5F5)],
+      );
+
+      canvas.drawPath(milkPath, Paint()..shader = milkGradient);
+
+      // رسم خط "زبد" خفيف على السطح لزيادة التأثير البصري للموج
+      final surfacePaint = Paint()
+        ..color = Colors.white.withOpacity(0.6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2;
+      
+      // رسم السطح فقط مرة أخرى ليكون أوضح
+      Path surfacePath = Path();
+      surfacePath.moveTo(glassRect.left + 5, springs[0].height);
+      for (int i = 0; i < springs.length - 1; i++) {
+        double x1 = glassRect.left + 5 + ((glassRect.width - 10) * i / (springs.length - 1));
+        double x2 = glassRect.left + 5 + ((glassRect.width - 10) * (i + 1) / (springs.length - 1));
+        surfacePath.cubicTo((x1 + x2) / 2, springs[i].height, (x1 + x2) / 2, springs[i+1].height, x2, springs[i+1].height);
+      }
+      canvas.drawPath(surfacePath, surfacePaint);
+    }
+  }
+
+  void _drawGlassFront(Canvas canvas) {
+    canvas.drawRRect(RRect.fromRectAndRadius(glassRect, const Radius.circular(12)), Paint()..color = Colors.white.withOpacity(0.3)..style=PaintingStyle.stroke..strokeWidth=4);
+  }
+
+  void _drawCookies(Canvas canvas) {
+    for (var c in cookies) {
+      canvas.save();
+      canvas.translate(c.x, c.y);
+      if (c.state != CookieState.HELD) { 
+        canvas.rotate(c.angle); 
+        _drawRealisticCookie(canvas, c); 
+      } else { 
+        canvas.rotate(0.05); 
+        canvas.save(); canvas.translate(-c.twistOffset, -c.twistOffset/4); _drawCookieLayer(canvas, c, true); canvas.restore();
+        canvas.save(); canvas.translate(c.twistOffset, c.twistOffset/4); _drawCookieLayer(canvas, c, false); canvas.restore();
+      }
+      canvas.restore();
+    }
+  }
+
+  void _drawRealisticCookie(Canvas canvas, Cookie c) {
+    _drawCookieLayer(canvas, c, false, isBottom: true);
+    
+    final creamPaint = Paint()
+      ..shader = ui.Gradient.radial(
+        Offset.zero, 
+        c.r, 
+        [const Color(0xFFFFFFF5), const Color(0xFFF5F5DC)], 
+        [0.8, 1.0]
+      );
+    canvas.drawCircle(Offset.zero, c.r * 0.94, creamPaint);
+    
+    _drawCookieLayer(canvas, c, true);
+  }
+
+  void _drawCookieLayer(Canvas canvas, Cookie c, bool hasFace, {bool isBottom = false}) {
+    double offset = isBottom ? 4 : 0;
+    
+    final paint = Paint()
+      ..shader = ui.Gradient.radial(
+        Offset(-c.r*0.4, -c.r*0.4), 
+        c.r * 1.6, 
+        [const Color(0xFF4E342E), const Color(0xFF1B0E0B)], 
+        [0.1, 1.0]
+      );
+    
+    if (isBottom) {
+       canvas.drawCircle(Offset(3, 3), c.r, Paint()..color = Colors.black54..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8));
+    }
+    
+    canvas.drawCircle(Offset(0, offset), c.r, paint);
+
+    final noisePaint = Paint()..color = Colors.black.withOpacity(0.2);
+    Random r = Random(c.hashCode + (isBottom ? 1 : 0));
+    for(int i=0; i<180; i++) {
+      double angle = r.nextDouble() * pi * 2;
+      double dist = r.nextDouble() * c.r;
+      canvas.drawCircle(Offset(cos(angle)*dist, sin(angle)*dist + offset), 0.7, noisePaint);
+    }
+
+    final detailPaint = Paint()
+      ..color = Colors.black.withOpacity(0.5)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+    
+    canvas.drawCircle(Offset(0, offset), c.r - 10, detailPaint);
+    
+    for (int i = 0; i < 36; i++) {
+      double angle = (i * 2 * pi) / 36;
+      double x1 = cos(angle) * (c.r - 12);
+      double y1 = sin(angle) * (c.r - 12) + offset;
+      double x2 = cos(angle) * c.r;
+      double y2 = sin(angle) * c.r + offset;
+      canvas.drawLine(Offset(x1, y1), Offset(x2, y2), detailPaint);
+    }
+
+    if (hasFace) {
+      final engravedPaint = Paint()
+        ..color = Colors.black.withOpacity(0.4)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0
+        ..strokeCap = StrokeCap.round;
+      
+      final creamReveal = Paint()..color = const Color(0xFFFFFFF5); 
+
+      if (c.faceType == 0) { // جمال
+        canvas.drawOval(Rect.fromCenter(center: const Offset(-20, -18), width: 15, height: 12), creamReveal);
+        canvas.drawOval(Rect.fromCenter(center: const Offset(20, -18), width: 15, height: 12), creamReveal);
+        
+        Path smilePath = Path()
+          ..moveTo(-30, 10)
+          ..quadraticBezierTo(0, 45, 30, 10)
+          ..quadraticBezierTo(0, 55, -30, 10);
+        canvas.drawPath(smilePath, creamReveal);
+        canvas.drawPath(smilePath, engravedPaint);
+        
+        canvas.drawCircle(const Offset(0, -2), 5, engravedPaint);
+      } else { // جميلة
+        canvas.drawOval(Rect.fromCenter(center: const Offset(-18, -12), width: 14, height: 18), creamReveal);
+        canvas.drawOval(Rect.fromCenter(center: const Offset(18, -12), width: 14, height: 18), creamReveal);
+        
+        for(int i=0; i<3; i++) {
+           Path hair = Path()..addArc(Rect.fromCenter(center: Offset(0, -28 - i*8), width: 70, height: 25), pi, pi);
+           canvas.drawPath(hair, engravedPaint);
+        }
+        
+        Path girlMouth = Path()
+          ..moveTo(-20, 15)
+          ..quadraticBezierTo(0, 35, 20, 15)
+          ..quadraticBezierTo(0, 40, -20, 15);
+        canvas.drawPath(girlMouth, creamReveal);
+        canvas.drawPath(girlMouth, engravedPaint);
+      }
+    }
+  }
+
+  void _drawParticles(Canvas canvas) {
+    for (var p in particles) {
+      canvas.drawCircle(Offset(p.x, p.y), p.size, Paint()..color = p.color.withOpacity(p.opacity));
+      canvas.drawCircle(Offset(p.x - p.size*0.3, p.y - p.size*0.3), p.size*0.3, Paint()..color = Colors.white.withOpacity(p.opacity));
+    }
+  }
+
+  void _drawTexts(Canvas canvas) {
+    for (var t in texts) {
+      TextPainter(
+        text: TextSpan(
+          text: "${t.text}\n${t.subText}", 
+          style: TextStyle(
+            color: t.color, 
+            fontSize: 28 * t.scale, 
+            fontWeight: FontWeight.w900, 
+            shadows: [Shadow(color: Colors.black26, offset: Offset(2, 2), blurRadius: 4)]
+          )
+        ), 
+        textAlign: TextAlign.center, 
+        textDirection: TextDirection.ltr
+      )..layout()..paint(canvas, Offset(t.x - 80, t.y));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
